@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable
@@ -14,6 +16,12 @@ import zarr
 from rich.console import Console
 from rich.table import Table
 
+from dexumi_visualizer.plugins import (
+    DEFAULT_PLUGIN_NAME,
+    get_plugin,
+    list_plugins,
+    plugin_errors,
+)
 from dexumi_visualizer.zarr_parser import (
     EpisodeSummary,
     SensorSummary,
@@ -24,7 +32,15 @@ from dexumi_visualizer.zarr_parser import (
 )
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
+plugins_app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console()
+
+app.add_typer(plugins_app, name="plugins")
+
+
+class StreamPreset(str, Enum):
+    minimal = "minimal"
+    full = "full"
 
 
 @app.command("list")
@@ -56,13 +72,29 @@ def info(episode: Path):
 def convert(
     episode: Path,
     output: Path = typer.Option(..., "-o", "--output", help="Output .rrd file"),
+    streams: str | None = typer.Option(
+        None,
+        "--streams",
+        help="Comma-separated stream filters (e.g. camera_0,camera_1,fsr).",
+    ),
+    cameras: str | None = typer.Option(
+        None,
+        "--cameras",
+        help="Comma-separated camera ids (e.g. 0,1,2).",
+    ),
+    preset: StreamPreset | None = typer.Option(
+        None,
+        "--preset",
+        help="Stream preset: minimal (1 cam + fsr) or full (all streams).",
+    ),
 ):
     """Convert a single episode into Rerun format."""
     if not is_episode_dir(episode):
         typer.echo(f"Not an episode directory: {episode}")
         raise typer.Exit(code=1)
     output.parent.mkdir(parents=True, exist_ok=True)
-    _convert_episode(episode, output_path=output, spawn=False)
+    stream_set = _build_stream_filter(streams=streams, cameras=cameras, preset=preset)
+    _convert_episode(episode, output_path=output, spawn=False, streams=stream_set)
     typer.echo(f"Wrote {output}")
 
 
@@ -79,19 +111,35 @@ def view(episode: Path):
 def batch(
     directory: Path,
     output_dir: Path = typer.Option(..., "-o", "--output", help="Output directory"),
+    streams: str | None = typer.Option(
+        None,
+        "--streams",
+        help="Comma-separated stream filters (e.g. camera_0,camera_1,fsr).",
+    ),
+    cameras: str | None = typer.Option(
+        None,
+        "--cameras",
+        help="Comma-separated camera ids (e.g. 0,1,2).",
+    ),
+    preset: StreamPreset | None = typer.Option(
+        None,
+        "--preset",
+        help="Stream preset: minimal (1 cam + fsr) or full (all streams).",
+    ),
 ):
     """Batch convert all episodes in a directory."""
     episodes = discover_episodes(directory)
     if not episodes:
         typer.echo("No episodes found.")
         raise typer.Exit(code=1)
+    stream_set = _build_stream_filter(streams=streams, cameras=cameras, preset=preset)
     output_dir.mkdir(parents=True, exist_ok=True)
     for episode in episodes:
         rel = _safe_relative(episode, directory)
         target_dir = output_dir / rel.parent
         target_dir.mkdir(parents=True, exist_ok=True)
         output_path = target_dir / f"{rel.name}.rrd"
-        _convert_episode(episode, output_path=output_path, spawn=False)
+        _convert_episode(episode, output_path=output_path, spawn=False, streams=stream_set)
         typer.echo(f"Wrote {output_path}")
 
 
@@ -99,19 +147,134 @@ def batch(
 def serve(
     directory: Path,
     port: int = typer.Option(8080, "--port", help="Port for the session service"),
+    streams: str | None = typer.Option(
+        None,
+        "--streams",
+        help="Comma-separated default stream filters (e.g. camera_0,fsr).",
+    ),
+    cameras: str | None = typer.Option(
+        None,
+        "--cameras",
+        help="Comma-separated camera ids (e.g. 0,1,2).",
+    ),
+    preset: StreamPreset | None = typer.Option(
+        None,
+        "--preset",
+        help="Stream preset: minimal (1 cam + fsr) or full (all streams).",
+    ),
 ):
     """Start a lightweight session service for HapticaGUI."""
     episodes = discover_episodes(directory)
     if not episodes:
         typer.echo("No episodes found.")
         raise typer.Exit(code=1)
-    handler = _make_session_handler(directory, episodes)
+    default_streams = _build_stream_filter(streams=streams, cameras=cameras, preset=preset)
+    handler = _make_session_handler(directory, episodes, default_streams=default_streams)
     server = ThreadingHTTPServer(("0.0.0.0", port), handler)
     typer.echo(f"Serving {len(episodes)} episodes on http://0.0.0.0:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         typer.echo("Shutting down.")
+
+
+@plugins_app.command("list")
+def plugins_list() -> None:
+    """List available dataset plugins."""
+    plugins = list_plugins()
+    table = Table(title="Dataset Plugins")
+    table.add_column("Name")
+    table.add_column("Description")
+    table.add_column("Extensions")
+    table.add_column("Priority", justify="right")
+    table.add_column("Default", justify="center")
+    for plugin in plugins:
+        info = plugin.info
+        extensions = ", ".join(info.extensions) if info.extensions else "-"
+        description = info.description or "-"
+        default = "yes" if plugin.name == DEFAULT_PLUGIN_NAME else ""
+        table.add_row(plugin.name, description, extensions, str(info.priority), default)
+    console.print(table)
+    errors = plugin_errors()
+    if errors:
+        console.print("Plugin load warnings:")
+        for error in errors:
+            console.print(f"- {error}")
+
+
+@plugins_app.command("info")
+def plugins_info(name: str) -> None:
+    """Show details for a specific plugin."""
+    plugin = get_plugin(name)
+    if plugin is None:
+        typer.echo(f"Plugin not found: {name}")
+        raise typer.Exit(code=1)
+    info = plugin.info
+    console.print(f"Plugin: {plugin.name}")
+    console.print(f"Description: {info.description or '-'}")
+    extensions = ", ".join(info.extensions) if info.extensions else "-"
+    console.print(f"Extensions: {extensions}")
+    console.print(f"Priority: {info.priority}")
+    hints = ", ".join(info.modality_hints) if info.modality_hints else "-"
+    console.print(f"Modality hints: {hints}")
+    console.print(f"Default: {'yes' if plugin.name == DEFAULT_PLUGIN_NAME else 'no'}")
+    if plugin.entry_point:
+        console.print(f"Entry point: {plugin.entry_point}")
+
+
+@plugins_app.command("validate")
+def validate_plugin(
+    name: str,
+    episode: Path | None = typer.Option(None, "--episode", help="Episode or dataset path"),
+) -> None:
+    """Validate a single plugin against a dataset/episode."""
+    from dexumi_visualizer.validation import PluginValidator
+
+    dataset_path = episode if episode is not None else Path.cwd()
+    if not dataset_path.exists():
+        typer.echo(f"Path not found: {dataset_path}")
+        raise typer.Exit(code=1)
+    plugin = get_plugin(name)
+    if plugin is None:
+        typer.echo(f"Plugin not found: {name}")
+        errors = plugin_errors()
+        if errors:
+            typer.echo("Plugin discovery errors:")
+            for entry in errors:
+                typer.echo(f"- {entry}")
+        raise typer.Exit(code=1)
+    validator = PluginValidator(plugin, dataset_path=dataset_path)
+    report = validator.run()
+    typer.echo(report.to_text())
+    typer.echo(report.to_json())
+    if not report.passed:
+        raise typer.Exit(code=1)
+
+
+@plugins_app.command("validate-all")
+def validate_all_plugins() -> None:
+    """Validate all discovered plugins in the package."""
+    from dexumi_visualizer.validation import PluginValidator
+
+    dataset_path = Path.cwd()
+    if not dataset_path.exists():
+        typer.echo(f"Path not found: {dataset_path}")
+        raise typer.Exit(code=1)
+    errors = plugin_errors()
+    if errors:
+        typer.echo("Plugin discovery errors:")
+        for entry in errors:
+            typer.echo(f"- {entry}")
+    failures = 0
+    for plugin in list_plugins():
+        validator = PluginValidator(plugin, dataset_path=dataset_path)
+        report = validator.run()
+        typer.echo(report.to_text())
+        typer.echo(report.to_json())
+        if not report.passed:
+            failures += 1
+    if failures:
+        raise typer.Exit(code=1)
 
 
 def _format_relative(path: Path, base: Path) -> str:
@@ -149,6 +312,52 @@ def _render_summary(summary: EpisodeSummary) -> None:
         video = str(sensor.video_path) if sensor.video_path else "-"
         table.add_row(sensor.name, sensor.kind, frames, arrays, video)
     console.print(table)
+
+
+def _parse_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _parse_camera_filters(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    cameras: set[str] = set()
+    for item in _parse_csv(value):
+        if item.startswith("camera_"):
+            cameras.add(item)
+            continue
+        if item.isdigit():
+            cameras.add(f"camera_{item}")
+            continue
+        raise typer.BadParameter(f"Invalid camera id '{item}'. Use comma-separated numbers like 0,1,2.")
+    return cameras
+
+
+def _build_stream_filter(
+    *,
+    streams: str | None,
+    cameras: str | None,
+    preset: StreamPreset | None,
+) -> set[str] | None:
+    stream_set: set[str] = set(_parse_csv(streams))
+    camera_set = _parse_camera_filters(cameras)
+
+    if preset == StreamPreset.minimal:
+        stream_set.add("fsr")
+        if camera_set:
+            stream_set.update(camera_set)
+        else:
+            stream_set.add("camera_0")
+    elif preset == StreamPreset.full:
+        # Full means no filtering unless explicit streams/cameras are provided.
+        pass
+
+    stream_set.update(camera_set)
+    if not stream_set:
+        return None
+    return stream_set
 
 
 def _convert_episode(
@@ -197,6 +406,27 @@ def _summary_to_text(summary: EpisodeSummary) -> str:
 class TimeSync:
     origin: float
     scale: float
+
+
+@dataclass
+class SessionRecord:
+    session_id: str
+    episode_path: Path
+    status: str = "launching"
+    playing: bool = True
+    paused: bool = False
+    current_frame: int = 0
+    timeline: str = "frame"
+    total_frames: int | None = None
+    duration_s: float | None = None
+    streams: list[str] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
+    error: str | None = None
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    log_started_at: float | None = None
+    log_finished_at: float | None = None
+    thread: threading.Thread | None = field(default=None, repr=False, compare=False)
 
 
 def _infer_time_scale(max_time: float) -> float:
@@ -697,20 +927,176 @@ def _max_in_zarr_array(array: zarr.Array) -> float:
     return max_value
 
 
-def _make_session_handler(root: Path, episodes: list[Path]) -> type[BaseHTTPRequestHandler]:
+def _choose_session_timeline(summary: EpisodeSummary) -> str:
+    for sensor in summary.sensors:
+        if "capture_time" in sensor.arrays or "receive_time" in sensor.arrays:
+            return "time"
+    return "frame"
+
+
+def _parse_session_state_path(path: str) -> str | None:
+    parts = path.strip("/").split("/")
+    if len(parts) != 3:
+        return None
+    if parts[0] != "sessions" or parts[2] != "state":
+        return None
+    return parts[1]
+
+
+def _coerce_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _update_current_frame(session: SessionRecord, value: object) -> None:
+    frame = _coerce_int(value)
+    if frame is None:
+        return
+    if session.total_frames is not None and session.total_frames > 0:
+        frame = max(0, min(frame, session.total_frames - 1))
+    else:
+        frame = max(frame, 0)
+    session.current_frame = frame
+
+
+def _apply_session_update(session: SessionRecord, payload: dict) -> None:
+    action = payload.get("action") or payload.get("command")
+    if isinstance(action, str):
+        action = action.lower()
+    if action == "play":
+        session.playing = True
+        session.paused = False
+    elif action == "pause":
+        session.playing = False
+        session.paused = True
+    elif action == "seek":
+        _update_current_frame(
+            session,
+            payload.get("frame") or payload.get("current_frame") or payload.get("seek"),
+        )
+
+    if "play" in payload and isinstance(payload.get("play"), bool):
+        session.playing = bool(payload["play"])
+        session.paused = not session.playing
+    if "pause" in payload and isinstance(payload.get("pause"), bool):
+        session.paused = bool(payload["pause"])
+        session.playing = not session.paused
+    if "playing" in payload and isinstance(payload.get("playing"), bool):
+        session.playing = bool(payload["playing"])
+        session.paused = not session.playing
+    if "paused" in payload and isinstance(payload.get("paused"), bool):
+        session.paused = bool(payload["paused"])
+        session.playing = not session.paused
+
+    for key in ("current_frame", "frame", "seek"):
+        if key in payload:
+            _update_current_frame(session, payload.get(key))
+
+    timeline = payload.get("timeline")
+    if isinstance(timeline, str) and timeline in {"frame", "time"}:
+        session.timeline = timeline
+
+    session.updated_at = time.time()
+
+
+def _session_payload(session: SessionRecord) -> dict:
+    previous_status = session.status
+    thread_alive = session.thread.is_alive() if session.thread else False
+    if session.error:
+        session.status = "error"
+    elif thread_alive:
+        if session.status == "launching":
+            session.status = "logging"
+    elif session.status in {"launching", "logging"}:
+        session.status = "ready"
+        if session.log_finished_at is None:
+            session.log_finished_at = time.time()
+    if session.status != previous_status:
+        session.updated_at = time.time()
+
+    return {
+        "id": session.session_id,
+        "status": session.status,
+        "playing": session.playing,
+        "paused": session.paused,
+        "current_frame": session.current_frame,
+        "timeline": session.timeline,
+        "total_frames": session.total_frames,
+        "duration_s": session.duration_s,
+        "episode_path": str(session.episode_path),
+        "streams": session.streams,
+        "metadata": session.metadata,
+        "viewer_state": session.status,
+        "log_thread_alive": thread_alive,
+        "log_started_at": session.log_started_at,
+        "log_finished_at": session.log_finished_at,
+        "error": session.error,
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
+    }
+
+
+def _make_session_handler(
+    root: Path,
+    episodes: list[Path],
+    *,
+    default_streams: set[str] | None = None,
+) -> type[BaseHTTPRequestHandler]:
     root = Path(root)
     episode_paths = list(episodes)
+    sessions: dict[str, SessionRecord] = {}
+    session_lock = threading.Lock()
+
+    def _store_session(session: SessionRecord) -> None:
+        with session_lock:
+            sessions[session.session_id] = session
+
+    def _update_session(session_id: str, **updates: object) -> None:
+        with session_lock:
+            session = sessions.get(session_id)
+            if session is None:
+                return
+            for key, value in updates.items():
+                setattr(session, key, value)
+            session.updated_at = time.time()
+
+    def _session_payload_by_id(session_id: str) -> dict | None:
+        with session_lock:
+            session = sessions.get(session_id)
+            if session is None:
+                return None
+            return _session_payload(session)
+
+    def _run_session(session_id: str, episode_path: Path, stream_set: set[str] | None) -> None:
+        _update_session(session_id, status="logging", log_started_at=time.time())
+        try:
+            _convert_episode(episode_path, None, True, streams=stream_set)
+        except Exception as exc:
+            _update_session(
+                session_id,
+                status="error",
+                error=str(exc),
+                log_finished_at=time.time(),
+            )
+            return
+        _update_session(session_id, status="ready", log_finished_at=time.time())
 
     class SessionHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - external API
-            if self.path in {"/", "/health"}:
+            path = self.path.split("?", 1)[0]
+            normalized = path.rstrip("/") if path != "/" else path
+            if normalized in {"/", "/health"}:
                 self._send_json({"status": "ok"})
                 return
-            if self.path.rstrip("/") == "/episodes":
+            if normalized == "/episodes":
                 self._send_json(_episodes_payload(root, episode_paths))
                 return
-            if self.path.startswith("/episodes/"):
-                parts = self.path.strip("/").split("/")
+            if normalized.startswith("/episodes/"):
+                parts = normalized.strip("/").split("/")
                 if len(parts) == 2:
                     episode = _episode_by_id(parts[1], episode_paths)
                     if episode is None:
@@ -719,28 +1105,78 @@ def _make_session_handler(root: Path, episodes: list[Path]) -> type[BaseHTTPRequ
                     summary = episode_summary(episode)
                     self._send_json(_summary_payload(summary))
                     return
+            session_id = _parse_session_state_path(normalized)
+            if session_id is not None:
+                payload = _session_payload_by_id(session_id)
+                if payload is None:
+                    self._send_json({"error": "session not found"}, status=404)
+                    return
+                self._send_json(payload)
+                return
             self._send_json({"error": "not found"}, status=404)
 
         def do_POST(self) -> None:  # noqa: N802 - external API
-            if self.path.rstrip("/") != "/sessions":
-                self._send_json({"error": "not found"}, status=404)
+            path = self.path.split("?", 1)[0]
+            normalized = path.rstrip("/") if path != "/" else path
+            if normalized == "/sessions":
+                payload = self._read_json()
+                episode_path = Path(payload.get("path", "")) if payload else None
+                if episode_path is None or not episode_path.exists() or not is_episode_dir(episode_path):
+                    self._send_json({"error": "invalid episode path"}, status=400)
+                    return
+                streams = payload.get("streams") if isinstance(payload, dict) else None
+                if isinstance(streams, list):
+                    stream_set = {str(item) for item in streams if str(item).strip()}
+                    if not stream_set:
+                        stream_set = None
+                else:
+                    stream_set = None
+                if stream_set is None:
+                    stream_set = default_streams
+                metadata = payload.get("metadata") if isinstance(payload, dict) else None
+                metadata = metadata if isinstance(metadata, dict) else {}
+
+                summary = episode_summary(episode_path)
+                session_id = f"session-{uuid.uuid4().hex[:8]}"
+                session = SessionRecord(
+                    session_id=session_id,
+                    episode_path=episode_path,
+                    status="launching",
+                    playing=True,
+                    paused=False,
+                    current_frame=0,
+                    timeline=_choose_session_timeline(summary),
+                    total_frames=summary.total_frames,
+                    duration_s=summary.duration_s,
+                    streams=sorted(stream_set) if stream_set else [],
+                    metadata=metadata,
+                )
+                thread = threading.Thread(
+                    target=_run_session,
+                    args=(session_id, episode_path, stream_set),
+                    daemon=True,
+                )
+                session.thread = thread
+                _store_session(session)
+                thread.start()
+                self._send_json({"id": session_id, "status": "launching"})
                 return
-            payload = self._read_json()
-            episode_path = Path(payload.get("path", "")) if payload else None
-            if episode_path is None or not episode_path.exists() or not is_episode_dir(episode_path):
-                self._send_json({"error": "invalid episode path"}, status=400)
+
+            session_id = _parse_session_state_path(normalized)
+            if session_id is not None:
+                payload = self._read_json()
+                with session_lock:
+                    session = sessions.get(session_id)
+                    if session is None:
+                        self._send_json({"error": "session not found"}, status=404)
+                        return
+                    if payload:
+                        _apply_session_update(session, payload)
+                    response = _session_payload(session)
+                self._send_json(response)
                 return
-            streams = payload.get("streams") if isinstance(payload, dict) else None
-            stream_set = set(streams) if isinstance(streams, list) else None
-            session_id = f"session-{uuid.uuid4().hex[:8]}"
-            thread = threading.Thread(
-                target=_convert_episode,
-                args=(episode_path, None, True),
-                kwargs={"streams": stream_set},
-                daemon=True,
-            )
-            thread.start()
-            self._send_json({"id": session_id, "status": "launching"})
+
+            self._send_json({"error": "not found"}, status=404)
 
         def log_message(self, format: str, *args: object) -> None:  # noqa: A003
             return

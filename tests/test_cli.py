@@ -24,3 +24,17 @@ def test_cli_info() -> None:
     assert result.exit_code == 0
     assert "Episode: episode_0" in result.stdout
     assert "Sensors" in result.stdout
+
+
+def test_cli_plugins_list() -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["plugins", "list"])
+    assert result.exit_code == 0
+    assert "zarr" in result.stdout
+
+
+def test_cli_plugins_info() -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["plugins", "info", "zarr"])
+    assert result.exit_code == 0
+    assert "Plugin: zarr" in result.stdout

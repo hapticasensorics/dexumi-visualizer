@@ -1,11 +1,13 @@
 """DexUMI web integration helpers for HapticaGUI-style dataset browsing."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -18,6 +20,10 @@ DEFAULT_DATASETS_PATH = os.environ.get(
 )
 DEFAULT_PREVIEW_SAMPLES = int(os.environ.get("DEXUMI_PREVIEW_SAMPLES", "12"))
 DEFAULT_FRAME_RATE = float(os.environ.get("DEXUMI_DEFAULT_FPS", "30"))
+DEFAULT_THUMBNAIL_WIDTH = int(os.environ.get("DEXUMI_THUMBNAIL_WIDTH", "240"))
+DEFAULT_THUMBNAIL_HEIGHT = int(os.environ.get("DEXUMI_THUMBNAIL_HEIGHT", "160"))
+DEFAULT_THUMBNAIL_QUALITY = int(os.environ.get("DEXUMI_THUMBNAIL_QUALITY", "70"))
+DEFAULT_THUMBNAIL_SAMPLE = float(os.environ.get("DEXUMI_THUMBNAIL_SAMPLE", "0.1"))
 
 STREAM_ALIASES = {
     "joint_angles": "joint_angles",
@@ -42,6 +48,11 @@ try:  # Optional dependency used when zarr is available.
     import numpy as np  # type: ignore
 except Exception:  # pragma: no cover - optional
     np = None
+
+try:  # Optional dependency used for thumbnails.
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover - optional
+    cv2 = None
 
 
 try:  # Reflex is optional so core logic can be tested without it.
@@ -111,13 +122,16 @@ def _episode_sensor_dirs(episode_path: Path) -> list[Path]:
 def _detect_streams(episode_path: Path) -> list[str]:
     streams: set[str] = set()
     for sensor in _episode_sensor_dirs(episode_path):
-        if sensor.name.startswith("camera"):
+        name = sensor.name.lower()
+        if "camera" in name or "video" in name:
             streams.add("camera")
-        if sensor.name.startswith("numeric"):
+        if name.startswith("numeric"):
             streams.add("numeric")
         for zarray_path in sensor.rglob(".zarray"):
             name = zarray_path.parent.name
             streams.add(STREAM_ALIASES.get(name, name))
+    if any(episode_path.glob("*.mp4")):
+        streams.add("camera")
     return sorted(streams)
 
 
@@ -210,6 +224,7 @@ def scan_dexumi_datasets(root_path: str | Path) -> list[dict]:
         total_duration_estimated = False
         for episode in episodes:
             metadata = extract_episode_metadata(episode)
+            thumbnail = generate_episode_thumbnail(episode)
             try:
                 relative_path = str(episode.relative_to(root))
             except ValueError:
@@ -225,6 +240,7 @@ def scan_dexumi_datasets(root_path: str | Path) -> list[dict]:
                     "name": episode.name,
                     "path": str(episode.resolve()),
                     "relative_path": relative_path,
+                    "thumbnail": thumbnail,
                     **metadata,
                 }
             )
@@ -347,6 +363,80 @@ def generate_preview_frames(
     return frames
 
 
+def _pick_thumbnail_video(episode_path: Path) -> Path | None:
+    candidates = sorted(episode_path.glob("*.mp4"))
+    if not candidates:
+        return None
+    preferred = [episode_path / "camera_0.mp4", episode_path / "camera_1.mp4"]
+    for candidate in preferred:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+@lru_cache(maxsize=128)
+def _encode_thumbnail(
+    video_path: str,
+    max_width: int,
+    max_height: int,
+    quality: int,
+    sample_fraction: float,
+) -> str | None:
+    if cv2 is None:
+        return None
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    try:
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if frame_count > 1:
+            frame_index = int(frame_count * sample_fraction)
+            frame_index = max(0, min(frame_index, frame_count - 1))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        success, frame = cap.read()
+        if not success or frame is None:
+            return None
+        height, width = frame.shape[:2]
+        if width > 0 and height > 0:
+            scale = min(max_width / width, max_height / height, 1.0)
+            if scale < 1.0:
+                new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+                frame = cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+        ok, buffer = cv2.imencode(
+            ".jpg",
+            frame,
+            [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)],
+        )
+        if not ok:
+            return None
+        encoded = base64.b64encode(buffer.tobytes()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+    finally:
+        cap.release()
+
+
+def generate_episode_thumbnail(
+    episode_path: str | Path,
+    *,
+    max_width: int = DEFAULT_THUMBNAIL_WIDTH,
+    max_height: int = DEFAULT_THUMBNAIL_HEIGHT,
+    quality: int = DEFAULT_THUMBNAIL_QUALITY,
+    sample_fraction: float = DEFAULT_THUMBNAIL_SAMPLE,
+) -> str | None:
+    episode = Path(episode_path)
+    video_path = _pick_thumbnail_video(episode)
+    if video_path is None:
+        return None
+    sample = min(max(sample_fraction, 0.0), 1.0)
+    return _encode_thumbnail(
+        str(video_path),
+        max_width,
+        max_height,
+        quality,
+        sample,
+    )
+
+
 def _request_json(base_url: str, method: str, path: str, payload: dict | None = None) -> dict:
     url = f"{base_url.rstrip('/')}{path}"
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -383,6 +473,7 @@ class DexUMIBrowserModel:
     session_status: str = "idle"
     session_message: str = ""
     session_state: dict = field(default_factory=dict)
+    session_state_supported: bool = True
     available_streams: list[str] = field(default_factory=list)
     stream_toggles: dict[str, bool] = field(default_factory=dict)
     loading: bool = False
@@ -480,6 +571,7 @@ class DexUMIBrowserModel:
         self.loading = True
         self.session_status = "loading"
         self.session_message = ""
+        self.session_state_supported = True
         payload: dict[str, Any] = {"path": self.selected_episode}
         streams = [name for name, enabled in self.stream_toggles.items() if enabled]
         if streams:
@@ -518,6 +610,11 @@ class DexUMIBrowserModel:
             f"/sessions/{self.session_id}/state",
         )
         if not response.get("ok"):
+            error = str(response.get("error", ""))
+            if error.startswith("404"):
+                self.session_state_supported = False
+                self.session_message = "Session state endpoint unavailable."
+                return
             self._handle_session_error(response, "Unable to fetch session state.")
             return
         data = response.get("data", {})
@@ -542,6 +639,7 @@ if rx is not None:  # pragma: no cover - UI integration only when Reflex is inst
         session_status: str = "idle"
         session_message: str = ""
         session_state: dict = {}
+        session_state_supported: bool = True
         available_streams: list[str] = []
         stream_toggles: dict[str, bool] = {}
         loading: bool = False
@@ -576,6 +674,14 @@ if rx is not None:  # pragma: no cover - UI integration only when Reflex is inst
         @rx.var
         def has_session_message(self) -> bool:
             return bool(self.session_message)
+
+        @rx.var
+        def should_poll_session(self) -> bool:
+            return (
+                bool(self.session_id)
+                and self.session_state_supported
+                and self.session_status in {"loading", "launching"}
+            )
 
         @rx.var
         def current_episodes(self) -> list[dict]:
@@ -671,6 +777,7 @@ if rx is not None:  # pragma: no cover - UI integration only when Reflex is inst
             self.loading = True
             self.session_status = "loading"
             self.session_message = ""
+            self.session_state_supported = True
             payload: dict[str, Any] = {"path": self.selected_episode}
             streams = [name for name, enabled in self.stream_toggles.items() if enabled]
             if streams:
@@ -712,6 +819,11 @@ if rx is not None:  # pragma: no cover - UI integration only when Reflex is inst
                 f"/sessions/{self.session_id}/state",
             )
             if not response.get("ok"):
+                error = str(response.get("error", ""))
+                if error.startswith("404"):
+                    self.session_state_supported = False
+                    self.session_message = "Session state endpoint unavailable."
+                    return
                 self._handle_session_error(response, "Unable to fetch session state.")
                 return
             data = response.get("data", {})
@@ -782,6 +894,26 @@ if rx is not None:  # pragma: no cover - UI integration only when Reflex is inst
             "1px solid #00d4aa",
             "1px solid rgba(255,255,255,0.08)",
         )
+        thumbnail = rx.cond(
+            episode["thumbnail"],
+            rx.image(
+                src=episode["thumbnail"],
+                width="120px",
+                height="72px",
+                object_fit="cover",
+                border_radius="10px",
+            ),
+            rx.box(
+                rx.text("No preview", font_size="0.65rem", color="#8c9aa5"),
+                width="120px",
+                height="72px",
+                border_radius="10px",
+                border="1px dashed rgba(255,255,255,0.12)",
+                display="flex",
+                align_items="center",
+                justify_content="center",
+            ),
+        )
         header = rx.hstack(
             rx.vstack(
                 rx.text(episode["name"], font_size="0.95rem", font_weight="600"),
@@ -812,7 +944,13 @@ if rx is not None:  # pragma: no cover - UI integration only when Reflex is inst
             width="100%",
         )
         return rx.box(
-            rx.vstack(header, stats, spacing="3", width="100%"),
+            rx.hstack(
+                thumbnail,
+                rx.vstack(header, stats, spacing="3", width="100%"),
+                spacing="3",
+                align="start",
+                width="100%",
+            ),
             padding="0.9rem",
             border=selected_border,
             border_radius="12px",
@@ -1093,15 +1231,22 @@ if rx is not None:  # pragma: no cover - UI integration only when Reflex is inst
         )
 
         interval = rx.box()
+        session_interval = rx.box()
         if hasattr(rx, "interval"):
             interval = rx.interval(
                 interval=1000,
                 on_tick=DexUMIBrowserState.advance_preview,
                 is_running=DexUMIBrowserState.preview_running,
             )
+            session_interval = rx.interval(
+                interval=2000,
+                on_tick=DexUMIBrowserState.refresh_session_state,
+                is_running=DexUMIBrowserState.should_poll_session,
+            )
 
         return rx.box(
             interval,
+            session_interval,
             rx.vstack(
                 header,
                 controls,
@@ -1122,6 +1267,7 @@ __all__ = [
     "DEFAULT_SESSION_SERVICE_URL",
     "DexUMIBrowserModel",
     "extract_episode_metadata",
+    "generate_episode_thumbnail",
     "generate_preview_frames",
     "scan_dexumi_datasets",
 ]
