@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -34,6 +35,40 @@ from dexumi_visualizer.zarr_parser import (
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 plugins_app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console()
+
+_DEBUG_ENV = "DEXUMI_VIZ_DEBUG"
+
+
+def _debug_enabled() -> bool:
+    value = os.getenv(_DEBUG_ENV)
+    if value is None:
+        return False
+    if value.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _debug_log(message: str) -> None:
+    if _debug_enabled():
+        typer.echo(f"[dexumi-viz:debug] {message}", err=True)
+
+
+_JOINT_ANGLES_CONTENTS = ("/robot/joints/**",)
+_HAND_MOTOR_CONTENTS = (
+    "/sensors/hand_motor**",
+    "/sensors/**/hand_motor**",
+)
+_POSE_CONTENTS = (
+    "/sensors/pose/**",
+    "/sensors/**/pose**",
+)
+_FSR_CONTENTS = ("/sensors/fsr/**",)
+_TIMESERIES_CONTENTS = (
+    *_JOINT_ANGLES_CONTENTS,
+    *_HAND_MOTOR_CONTENTS,
+    *_POSE_CONTENTS,
+    *_FSR_CONTENTS,
+)
 
 app.add_typer(plugins_app, name="plugins")
 
@@ -374,6 +409,14 @@ def _convert_episode(
         rr.save(str(output_path))
 
     summary = episode_summary(episode_path)
+    if _debug_enabled():
+        sensor_lines = [
+            f"{sensor.name} (kind={sensor.kind}, frames={sensor.frames}, arrays={sensor.arrays})"
+            for sensor in summary.sensors
+        ]
+        _debug_log(f"episode={summary.name} sensors={len(summary.sensors)}")
+        for line in sensor_lines:
+            _debug_log(f"sensor {line}")
     rr.log("episode/summary", rr.TextDocument(_summary_to_text(summary)), static=True)
 
     time_sync = _compute_time_sync(episode_path, summary.sensors)
@@ -389,56 +432,87 @@ def _send_visualization_blueprint(summary: EpisodeSummary, streams: set[str] | N
     import rerun as rr
     import rerun.blueprint as rrb
 
-    # Collect camera sensors for 2D views
-    camera_views = []
+    def _camera_columns(count: int) -> int:
+        if count <= 0:
+            return 1
+        if count <= 3:
+            return count
+        if count == 4:
+            return 2
+        if count <= 6:
+            return 3
+        return 4
+
+    camera_views: list[rrb.View] = []
     for sensor in summary.sensors:
-        if sensor.kind == "camera" or "camera" in sensor.name.lower():
-            if streams is None or _sensor_matches_streams(sensor, streams):
-                # Create 2D view for each camera
-                camera_views.append(
-                    rrb.Spatial2DView(
-                        name=sensor.name,
-                        origin=f"/sensors/{sensor.name}",
-                    )
-                )
+        if sensor.video_path is None:
+            continue
+        if streams is not None and not _sensor_matches_streams(sensor, streams):
+            continue
+        camera_views.append(
+            rrb.Spatial2DView(
+                name=sensor.name,
+                origin=f"/sensors/{sensor.name}",
+            )
+        )
 
-    # Time series view for numeric sensors (fsr, joint_angles, etc.)
-    timeseries_view = rrb.TimeSeriesView(
-        name="Sensors",
+    joint_angles_view = rrb.TimeSeriesView(
+        name="Joint Angles",
         origin="/",
-        contents=[
-            "/robot/joints/**",
-            "/sensors/fsr/**",
-            "/_properties/**",
-        ],
+        contents=list(_JOINT_ANGLES_CONTENTS),
+    )
+    hand_motor_view = rrb.TimeSeriesView(
+        name="Hand Motor",
+        origin="/",
+        contents=list(_HAND_MOTOR_CONTENTS),
+    )
+    pose_view = rrb.TimeSeriesView(
+        name="Pose",
+        origin="/",
+        contents=list(_POSE_CONTENTS),
+    )
+    fsr_view = rrb.TimeSeriesView(
+        name="FSR",
+        origin="/",
+        contents=list(_FSR_CONTENTS),
     )
 
-    # Text view for episode summary
-    text_view = rrb.TextDocumentView(
-        name="Summary",
-        origin="/episode/summary",
+    sensors_row = rrb.Horizontal(
+        joint_angles_view,
+        hand_motor_view,
+        pose_view,
+        fsr_view,
+        column_shares=[1, 1, 1, 1],
     )
 
-    # Build layout: cameras on top row, sensors + summary on bottom
-    if camera_views:
-        # Grid of cameras (max 4 per row)
-        if len(camera_views) <= 2:
-            camera_row = rrb.Horizontal(*camera_views)
+    if _debug_enabled():
+        if camera_views:
+            _debug_log("blueprint cameras=" + ", ".join(view.name for view in camera_views))
         else:
-            camera_row = rrb.Grid(*camera_views, columns=min(4, len(camera_views)))
+            _debug_log("blueprint cameras=none")
+        _debug_log(
+            "blueprint timeseries contents="
+            + ", ".join(
+                [
+                    *_JOINT_ANGLES_CONTENTS,
+                    *_HAND_MOTOR_CONTENTS,
+                    *_POSE_CONTENTS,
+                    *_FSR_CONTENTS,
+                ]
+            )
+        )
 
+    if camera_views:
+        camera_grid = rrb.Grid(*camera_views, grid_columns=_camera_columns(len(camera_views)))
         blueprint = rrb.Blueprint(
             rrb.Vertical(
-                camera_row,
-                rrb.Horizontal(timeseries_view, text_view, column_shares=[3, 1]),
-                row_shares=[2, 1],
+                camera_grid,
+                sensors_row,
+                row_shares=[7, 3],
             )
         )
     else:
-        # No cameras, just sensors and summary
-        blueprint = rrb.Blueprint(
-            rrb.Horizontal(timeseries_view, text_view, column_shares=[3, 1])
-        )
+        blueprint = rrb.Blueprint(sensors_row)
 
     rr.send_blueprint(blueprint)
 
@@ -539,11 +613,14 @@ def _log_sensor_groups(
 ) -> None:
     for sensor in sensors:
         if streams and not _sensor_matches_streams(sensor, streams):
+            _debug_log(f"skip sensor={sensor.name} kind={sensor.kind} (stream filter)")
             continue
         if sensor.kind in {"camera", "video"} and sensor.video_path:
+            _debug_log(f"log camera sensor={sensor.name} video={sensor.video_path}")
             _log_camera_sensor(sensor, episode_path, time_sync=time_sync)
             continue
         if sensor.kind in {"numeric", "array"}:
+            _debug_log(f"log numeric sensor={sensor.name} kind={sensor.kind}")
             _log_numeric_sensor(sensor, episode_path, time_sync=time_sync)
 
 
@@ -558,6 +635,7 @@ def _log_camera_sensor(
         return
     camera_path = f"sensors/{sensor.name}"
     image_path = f"{camera_path}/image"
+    _debug_log(f"camera entity_path={camera_path} image_path={image_path}")
 
     capture_times = _load_capture_times(episode_path, sensor.name)
     times = _normalize_times(capture_times, time_sync) if capture_times is not None else None
@@ -568,6 +646,7 @@ def _log_camera_sensor(
         group = zarr.open_group(str(group_path), mode="r")
 
     if group is not None:
+        _debug_log(f"camera zarr group found for {sensor.name} arrays={sorted(group.array_keys())}")
         if "intrinsics" in group.array_keys():
             intrinsics = np.asarray(group["intrinsics"][:], dtype=np.float64)
             _log_camera_intrinsics(intrinsics, image_path, video_path, times)
@@ -584,6 +663,7 @@ def _log_camera_sensor(
             if key in ignored:
                 continue
             array = group[key]
+            _debug_log(f"camera array={key} base_path={camera_path}")
             _log_zarr_array_series(
                 array,
                 array_name=key,
@@ -591,6 +671,8 @@ def _log_camera_sensor(
                 sensor_name=sensor.name,
                 base_path=camera_path,
             )
+    else:
+        _debug_log(f"camera zarr group missing for {sensor.name}")
 
     _log_video_frames(video_path, image_path, times, episode_path, time_sync=time_sync)
 
@@ -818,8 +900,10 @@ def _log_numeric_sensor(
     if sensor.kind == "numeric":
         group_path = episode_path / sensor.name
         if not (group_path / ".zgroup").exists():
+            _debug_log(f"numeric group missing: {group_path}")
             return
         group = zarr.open_group(str(group_path), mode="r")
+        _debug_log(f"numeric group={sensor.name} arrays={sorted(group.array_keys())}")
         time_values = None
         for key in ("capture_time", "receive_time"):
             if key in group.array_keys():
@@ -831,6 +915,7 @@ def _log_numeric_sensor(
             if key in {"capture_time", "receive_time"}:
                 continue
             array = group[key]
+            _debug_log(f"numeric array={key} base_path={base_path}")
             _log_zarr_array_series(
                 array,
                 array_name=key,
@@ -842,8 +927,12 @@ def _log_numeric_sensor(
 
     array_path = episode_path / sensor.name
     if not array_path.exists():
+        _debug_log(f"array path missing: {array_path}")
         return
     array = zarr.open_array(str(array_path), mode="r")
+    _debug_log(
+        f"array sensor={sensor.name} shape={array.shape} dtype={array.dtype} base_path=sensors"
+    )
     _log_zarr_array_series(
         array,
         array_name=sensor.name,
@@ -865,11 +954,33 @@ def _log_zarr_array_series(
 
     if array.ndim == 0:
         entity_path = _default_entity_path(base_path, array_name)
+        _debug_log(
+            "array scalar "
+            f"name={array_name} entity_path={entity_path} "
+            f"timeseries={'yes' if _timeseries_includes_path(entity_path) else 'no'}"
+        )
         rr.log(entity_path, rr.Scalars(float(array[()])))
         return
     length = int(array.shape[0])
     use_times = times if times is not None and len(times) == length else None
     max_value = _max_in_zarr_array(array) if _is_fsr_array(array_name) else None
+    if length > 0:
+        sample0 = None
+        try:
+            sample0 = np.asarray(array[0])
+        except Exception:
+            sample0 = None
+        entity_path = _describe_array_entity_path(
+            sample0,
+            array_name=array_name,
+            sensor_name=sensor_name,
+            base_path=base_path,
+        )
+        if entity_path is not None:
+            _debug_log(
+                f"array name={array_name} entity_path={entity_path} "
+                f"timeseries={'yes' if _timeseries_includes_path(entity_path) else 'no'}"
+            )
     for index in range(length):
         if use_times is not None:
             rr.set_time("time", duration=float(use_times[index]))
@@ -924,6 +1035,24 @@ def _log_array_sample(
     rr.log(entity_path, rr.Scalars(values.ravel()))
 
 
+def _describe_array_entity_path(
+    sample: np.ndarray | None,
+    *,
+    array_name: str,
+    sensor_name: str | None,
+    base_path: str,
+) -> str | None:
+    if sample is not None and _is_pose_array(array_name, sample):
+        if sensor_name is None:
+            return f"sensors/pose/{array_name}"
+        return f"sensors/{sensor_name}/{array_name}"
+    if _is_joint_angles_array(array_name):
+        return f"robot/joints/{array_name}"
+    if _is_fsr_array(array_name):
+        return _fsr_entity_path(sensor_name, array_name)
+    return _default_entity_path(base_path, array_name)
+
+
 def _default_entity_path(base_path: str, array_name: str) -> str:
     if base_path:
         return f"{base_path}/{array_name}"
@@ -933,6 +1062,19 @@ def _default_entity_path(base_path: str, array_name: str) -> str:
 def _fsr_entity_path(sensor_name: str | None, array_name: str) -> str:
     suffix = sensor_name or "fsr"
     return f"sensors/fsr/{suffix}/{array_name}"
+
+
+def _timeseries_includes_path(entity_path: str) -> bool:
+    normalized = f"/{entity_path.strip('/')}"
+    for pattern in _TIMESERIES_CONTENTS:
+        if pattern.endswith("**"):
+            prefix = pattern[:-2]
+            if normalized.startswith(prefix):
+                return True
+            continue
+        if normalized == pattern:
+            return True
+    return False
 
 
 def _is_joint_angles_array(name: str) -> bool:
