@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import uuid
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable
@@ -165,7 +166,9 @@ def _convert_episode(
     summary = episode_summary(episode_path)
     rr.log("episode/summary", rr.TextDocument(_summary_to_text(summary)), static=True)
 
-    _log_sensor_groups(episode_path, summary.sensors, streams=streams)
+    time_sync = _compute_time_sync(episode_path, summary.sensors)
+    _log_calibration_points(episode_path)
+    _log_sensor_groups(episode_path, summary.sensors, streams=streams, time_sync=time_sync)
 
     # rr.init(spawn=True) already launches the viewer.
 
@@ -190,54 +193,276 @@ def _summary_to_text(summary: EpisodeSummary) -> str:
     return json.dumps(payload, indent=2)
 
 
-def _log_sensor_groups(
-    episode_path: Path, sensors: Iterable[SensorSummary], streams: set[str] | None = None
-) -> None:
-    import rerun as rr
+@dataclass(frozen=True)
+class TimeSync:
+    origin: float
+    scale: float
 
+
+def _infer_time_scale(max_time: float) -> float:
+    if max_time > 1e17:
+        return 1e-9
+    if max_time > 1e14:
+        return 1e-6
+    if max_time > 1e11:
+        return 1e-3
+    return 1.0
+
+
+def _compute_time_sync(episode_path: Path, sensors: Iterable[SensorSummary]) -> TimeSync | None:
+    arrays: list[np.ndarray] = []
+    for sensor in sensors:
+        if sensor.kind not in {"camera", "numeric"}:
+            continue
+        group_path = episode_path / sensor.name
+        if not (group_path / ".zgroup").exists():
+            continue
+        group = zarr.open_group(str(group_path), mode="r")
+        for key in ("capture_time", "receive_time"):
+            if key in group.array_keys():
+                values = np.asarray(group[key][:], dtype=np.float64)
+                if values.size:
+                    arrays.append(values)
+                break
+    if not arrays:
+        return None
+    min_time = min(float(np.nanmin(values)) for values in arrays if values.size)
+    max_time = max(float(np.nanmax(values)) for values in arrays if values.size)
+    scale = _infer_time_scale(max(abs(min_time), abs(max_time)))
+    return TimeSync(origin=min_time, scale=scale)
+
+
+def _normalize_times(values: np.ndarray, time_sync: TimeSync | None) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    if time_sync is None:
+        return normalize_timestamps(values)
+    scaled = values * time_sync.scale
+    return scaled - time_sync.origin * time_sync.scale
+
+
+def _log_sensor_groups(
+    episode_path: Path,
+    sensors: Iterable[SensorSummary],
+    streams: set[str] | None = None,
+    time_sync: TimeSync | None = None,
+) -> None:
     for sensor in sensors:
         if streams and not _sensor_matches_streams(sensor, streams):
             continue
-        if sensor.kind == "camera" and sensor.video_path:
-            _log_video_asset(sensor, episode_path)
-            continue
-        if sensor.kind == "video" and sensor.video_path:
-            _log_video_asset(sensor, episode_path)
+        if sensor.kind in {"camera", "video"} and sensor.video_path:
+            _log_camera_sensor(sensor, episode_path, time_sync=time_sync)
             continue
         if sensor.kind in {"numeric", "array"}:
-            _log_numeric_sensor(sensor, episode_path)
+            _log_numeric_sensor(sensor, episode_path, time_sync=time_sync)
 
 
-def _log_video_asset(sensor: SensorSummary, episode_path: Path) -> None:
-    import rerun as rr
-
+def _log_camera_sensor(
+    sensor: SensorSummary,
+    episode_path: Path,
+    *,
+    time_sync: TimeSync | None,
+) -> None:
     video_path = sensor.video_path
     if video_path is None:
         return
-    entity_path = f"video/{sensor.name}"
-    video_asset = rr.AssetVideo(path=str(video_path))
-    rr.log(entity_path, video_asset, static=True)
+    camera_path = f"sensors/{sensor.name}"
+    image_path = f"{camera_path}/image"
 
     capture_times = _load_capture_times(episode_path, sensor.name)
-    try:
-        frame_timestamps_ns = video_asset.read_frame_timestamps_nanos()
-    except Exception:
-        return
+    times = _normalize_times(capture_times, time_sync) if capture_times is not None else None
 
-    if capture_times is not None:
-        times = normalize_timestamps(capture_times)
-        length = min(len(times), len(frame_timestamps_ns))
-        rr.send_columns(
-            entity_path,
-            indexes=[rr.TimeColumn("time", duration=times[:length])],
-            columns=rr.VideoFrameReference.columns_nanos(frame_timestamps_ns[:length]),
+    group = None
+    group_path = episode_path / sensor.name
+    if (group_path / ".zgroup").exists():
+        group = zarr.open_group(str(group_path), mode="r")
+
+    if group is not None:
+        if "intrinsics" in group.array_keys():
+            intrinsics = np.asarray(group["intrinsics"][:], dtype=np.float64)
+            _log_camera_intrinsics(intrinsics, image_path, video_path, times)
+
+        pose_keys = [key for key in ("pose", "pose_interp") if key in group.array_keys()]
+        primary_pose = pose_keys[0] if pose_keys else None
+        for key in pose_keys:
+            pose_array = group[key]
+            entity_path = camera_path if key == primary_pose else f"{camera_path}/{key}"
+            _log_pose_series(pose_array, times, entity_path)
+
+        ignored = {"capture_time", "receive_time", "pose", "pose_interp", "intrinsics"}
+        for key in sorted(group.array_keys()):
+            if key in ignored:
+                continue
+            array = group[key]
+            _log_zarr_array_series(
+                array,
+                array_name=key,
+                times=times,
+                sensor_name=sensor.name,
+                base_path=camera_path,
+            )
+
+    _log_video_frames(video_path, image_path, times, episode_path, time_sync=time_sync)
+
+
+def _log_video_frames(
+    video_path: Path,
+    image_path: str,
+    times: np.ndarray | None,
+    episode_path: Path,
+    *,
+    time_sync: TimeSync | None,
+) -> None:
+    import cv2
+    import rerun as rr
+
+    if times is None:
+        frame_count = _video_frame_count(video_path)
+        if frame_count is not None:
+            matching = _find_matching_capture_times(episode_path, frame_count)
+            if matching is not None:
+                times = _normalize_times(matching, time_sync)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        cap.release()
+        return
+    try:
+        frame_index = 0
+        max_frames = len(times) if times is not None else None
+        while True:
+            if max_frames is not None and frame_index >= max_frames:
+                break
+            ret, frame_bgr = cap.read()
+            if not ret:
+                break
+            if times is not None and frame_index < len(times):
+                rr.set_time("time", duration=float(times[frame_index]))
+            else:
+                rr.set_time("frame", sequence=frame_index)
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            rr.log(image_path, rr.Image(frame_rgb))
+            frame_index += 1
+    finally:
+        cap.release()
+
+
+def _read_video_resolution(video_path: Path) -> tuple[int | None, int | None]:
+    try:
+        import cv2  # noqa: WPS433
+    except Exception:
+        return None, None
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        cap.release()
+        return None, None
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    if width <= 0 or height <= 0:
+        return None, None
+    return width, height
+
+
+def _log_pose_series(pose_array: zarr.Array, times: np.ndarray | None, entity_path: str) -> None:
+    import rerun as rr
+
+    if pose_array.ndim < 2:
+        return
+    length = pose_array.shape[0]
+    use_times = times if times is not None and len(times) == length else None
+    for index in range(length):
+        if use_times is not None:
+            rr.set_time("time", duration=float(use_times[index]))
+        else:
+            rr.set_time("frame", sequence=index)
+        matrix = np.asarray(pose_array[index], dtype=np.float64)
+        _log_transform_from_matrix(matrix, entity_path)
+
+
+def _log_transform_from_matrix(matrix: np.ndarray, entity_path: str) -> None:
+    import rerun as rr
+
+    mat = np.asarray(matrix, dtype=np.float64)
+    if mat.shape == (4, 4):
+        rotation = mat[:3, :3]
+        translation = mat[:3, 3]
+    elif mat.shape == (3, 4):
+        rotation = mat[:3, :3]
+        translation = mat[:3, 3]
+    elif mat.shape == (3, 3):
+        rotation = mat
+        translation = np.zeros(3, dtype=np.float64)
+    else:
+        return
+    rr.log(entity_path, rr.Transform3D(mat3x3=rotation, translation=translation))
+
+
+def _log_camera_intrinsics(
+    intrinsics: np.ndarray,
+    image_path: str,
+    video_path: Path,
+    times: np.ndarray | None,
+) -> None:
+    import rerun as rr
+
+    intrinsics = np.asarray(intrinsics, dtype=np.float64)
+    width, height = _read_video_resolution(video_path)
+    if intrinsics.ndim == 3 and times is not None and len(times) == intrinsics.shape[0]:
+        for index, matrix in enumerate(intrinsics):
+            if matrix.shape != (3, 3):
+                continue
+            rr.set_time("time", duration=float(times[index]))
+            if width is not None and height is not None:
+                rr.log(
+                    image_path,
+                    rr.Pinhole(image_from_camera=matrix, width=width, height=height),
+                )
+            else:
+                rr.log(image_path, rr.Pinhole(image_from_camera=matrix))
+        return
+    if intrinsics.ndim == 3:
+        intrinsics = intrinsics[0]
+    if intrinsics.shape != (3, 3):
+        return
+    if width is not None and height is not None:
+        rr.log(
+            image_path,
+            rr.Pinhole(image_from_camera=intrinsics, width=width, height=height),
+            static=True,
         )
     else:
-        rr.send_columns(
-            entity_path,
-            indexes=[rr.TimeColumn("frame", sequence=np.arange(len(frame_timestamps_ns)))],
-            columns=rr.VideoFrameReference.columns_nanos(frame_timestamps_ns),
-        )
+        rr.log(image_path, rr.Pinhole(image_from_camera=intrinsics), static=True)
+
+
+def _find_matching_capture_times(episode_path: Path, frame_count: int) -> np.ndarray | None:
+    for entry in sorted(episode_path.iterdir()):
+        if not entry.is_dir():
+            continue
+        if not (entry / ".zgroup").exists():
+            continue
+        group = zarr.open_group(str(entry), mode="r")
+        for key in ("capture_time", "receive_time"):
+            if key not in group.array_keys():
+                continue
+            array = group[key]
+            if array.ndim < 1 or array.shape[0] != frame_count:
+                continue
+            return np.asarray(array[:], dtype=np.float64)
+    return None
+
+
+def _video_frame_count(video_path: Path) -> int | None:
+    try:
+        import cv2  # noqa: WPS433
+    except Exception:
+        return None
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        cap.release()
+        return None
+    count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    return count if count > 0 else None
 
 
 def _load_capture_times(episode_path: Path, sensor_name: str) -> np.ndarray | None:
@@ -253,47 +478,223 @@ def _load_capture_times(episode_path: Path, sensor_name: str) -> np.ndarray | No
     return None
 
 
-def _log_numeric_sensor(sensor: SensorSummary, episode_path: Path) -> None:
+def _log_calibration_points(episode_path: Path) -> None:
+    import pickle
+
     import rerun as rr
 
+    roots = [episode_path, episode_path.parent]
+    seen: set[Path] = set()
+    for root in roots:
+        for pkl_path in sorted(root.glob("*.pkl")):
+            if pkl_path in seen:
+                continue
+            seen.add(pkl_path)
+            try:
+                with pkl_path.open("rb") as handle:
+                    payload = pickle.load(handle)
+            except Exception:
+                continue
+            if not isinstance(payload, dict) or "points" not in payload:
+                continue
+            points = _coerce_points_3d(payload.get("points"))
+            if points is None:
+                continue
+            entity_path = f"calibration/{pkl_path.stem}"
+            rr.log(entity_path, rr.Points3D(points), static=True)
+
+
+def _coerce_points_3d(points: object) -> np.ndarray | None:
+    if points is None:
+        return None
+    array = np.asarray(points, dtype=np.float32)
+    if array.ndim != 2 or array.shape[0] == 0:
+        return None
+    if array.shape[1] == 2:
+        zeros = np.zeros((array.shape[0], 1), dtype=array.dtype)
+        return np.concatenate([array, zeros], axis=1)
+    if array.shape[1] >= 3:
+        return array[:, :3]
+    return None
+
+
+def _log_numeric_sensor(
+    sensor: SensorSummary,
+    episode_path: Path,
+    *,
+    time_sync: TimeSync | None,
+) -> None:
     if sensor.kind == "numeric":
         group_path = episode_path / sensor.name
+        if not (group_path / ".zgroup").exists():
+            return
         group = zarr.open_group(str(group_path), mode="r")
-        timestamps = None
+        time_values = None
         for key in ("capture_time", "receive_time"):
             if key in group.array_keys():
-                timestamps = normalize_timestamps(np.asarray(group[key][:], dtype=np.float64))
+                time_values = np.asarray(group[key][:], dtype=np.float64)
                 break
-        arrays = [key for key in group.array_keys() if key not in {"capture_time", "receive_time"}]
-        if not arrays:
-            return
-        length = min(_array_length(group[key]) for key in arrays)
-        for idx in range(length):
-            if timestamps is not None:
-                rr.set_time("time", duration=float(timestamps[idx]))
-            else:
-                rr.set_time("frame", sequence=idx)
-            for key in arrays:
-                rr.log(f"{sensor.name}/{key}", rr.Scalars(np.asarray(group[key][idx]).ravel()))
+        times = _normalize_times(time_values, time_sync) if time_values is not None else None
+        base_path = f"sensors/{sensor.name}"
+        for key in sorted(group.array_keys()):
+            if key in {"capture_time", "receive_time"}:
+                continue
+            array = group[key]
+            _log_zarr_array_series(
+                array,
+                array_name=key,
+                times=times,
+                sensor_name=sensor.name,
+                base_path=base_path,
+            )
         return
 
     array_path = episode_path / sensor.name
     if not array_path.exists():
         return
     array = zarr.open_array(str(array_path), mode="r")
+    _log_zarr_array_series(
+        array,
+        array_name=sensor.name,
+        times=None,
+        sensor_name=None,
+        base_path="sensors",
+    )
+
+
+def _log_zarr_array_series(
+    array: zarr.Array,
+    *,
+    array_name: str,
+    times: np.ndarray | None,
+    sensor_name: str | None,
+    base_path: str,
+) -> None:
+    import rerun as rr
+
     if array.ndim == 0:
-        rr.log(f"{sensor.name}", rr.Scalars(float(array[()])))
+        entity_path = _default_entity_path(base_path, array_name)
+        rr.log(entity_path, rr.Scalars(float(array[()])))
         return
-    length = array.shape[0]
-    for idx in range(length):
-        rr.set_time("frame", sequence=idx)
-        rr.log(f"{sensor.name}", rr.Scalars(np.asarray(array[idx]).ravel()))
+    length = int(array.shape[0])
+    use_times = times if times is not None and len(times) == length else None
+    max_value = _max_in_zarr_array(array) if _is_fsr_array(array_name) else None
+    for index in range(length):
+        if use_times is not None:
+            rr.set_time("time", duration=float(use_times[index]))
+        else:
+            rr.set_time("frame", sequence=index)
+        sample = np.asarray(array[index])
+        _log_array_sample(
+            sample,
+            array_name=array_name,
+            sensor_name=sensor_name,
+            base_path=base_path,
+            max_value=max_value,
+        )
 
 
-def _array_length(array: zarr.Array) -> int:
-    if array.ndim == 0:
-        return 1
-    return int(array.shape[0])
+def _log_array_sample(
+    sample: np.ndarray,
+    *,
+    array_name: str,
+    sensor_name: str | None,
+    base_path: str,
+    max_value: float | None,
+) -> None:
+    import rerun as rr
+
+    values = np.asarray(sample)
+    if _is_pose_array(array_name, values):
+        pose_path = f"sensors/pose/{array_name}" if sensor_name is None else f"sensors/{sensor_name}/{array_name}"
+        _log_transform_from_matrix(values, pose_path)
+        return
+    if _is_joint_angles_array(array_name):
+        joint_base = f"robot/joints/{array_name}"
+        joint_values = values.astype(np.float64).ravel()
+        rr.log(f"{joint_base}/bar", rr.BarChart(joint_values))
+        for idx, value in enumerate(joint_values):
+            rr.log(f"{joint_base}/joint_{idx}", rr.Scalars(float(value)))
+        return
+    if _is_fsr_array(array_name):
+        fsr_values = values.astype(np.float64).ravel()
+        colors = _colorize_fsr_values(fsr_values, max_value=max_value or 0.0)
+        entity_path = _fsr_entity_path(sensor_name, array_name)
+        positions = np.column_stack(
+            (np.arange(fsr_values.shape[0], dtype=np.float32), fsr_values.astype(np.float32))
+        )
+        rr.log(
+            entity_path,
+            rr.Points2D(positions, colors=_coerce_rr_colors(rr, colors)),
+        )
+        rr.log(f"{entity_path}/values", rr.Scalars(fsr_values))
+        return
+    entity_path = _default_entity_path(base_path, array_name)
+    rr.log(entity_path, rr.Scalars(values.ravel()))
+
+
+def _default_entity_path(base_path: str, array_name: str) -> str:
+    if base_path:
+        return f"{base_path}/{array_name}"
+    return array_name
+
+
+def _fsr_entity_path(sensor_name: str | None, array_name: str) -> str:
+    suffix = sensor_name or "fsr"
+    return f"sensors/fsr/{suffix}/{array_name}"
+
+
+def _is_joint_angles_array(name: str) -> bool:
+    return "joint_angles" in name
+
+
+def _is_fsr_array(name: str) -> bool:
+    return "fsr" in name or "raw_voltage" in name
+
+
+def _is_pose_array(name: str, values: np.ndarray) -> bool:
+    if "pose" not in name:
+        return False
+    return values.shape in {(4, 4), (3, 4), (3, 3)}
+
+
+def _colorize_fsr_values(values: np.ndarray, *, max_value: float) -> list[tuple[int, int, int, int]]:
+    if max_value <= 0 or np.isnan(max_value):
+        return [(128, 128, 128, 255) for _ in values]
+    intensities = np.clip(values / max_value, 0.0, 1.0)
+    colors: list[tuple[int, int, int, int]] = []
+    for intensity in intensities:
+        r = int(255 * intensity)
+        g = int(64 * (1.0 - intensity))
+        b = int(255 * (1.0 - intensity))
+        colors.append((r, g, b, 255))
+    return colors
+
+
+def _coerce_rr_colors(rr_module, colors: list[tuple[int, int, int, int]]):
+    if hasattr(rr_module, "Color"):
+        return [rr_module.Color(r, g, b, a) for r, g, b, a in colors]
+    if hasattr(rr_module, "Rgba32"):
+        return [rr_module.Rgba32(r, g, b, a) for r, g, b, a in colors]
+    return colors
+
+
+def _max_in_zarr_array(array: zarr.Array) -> float:
+    if array.size == 0:
+        return 0.0
+    max_value = float("-inf")
+    chunk_size = array.chunks[0] if array.chunks else array.shape[0]
+    for start in range(0, array.shape[0], chunk_size):
+        stop = min(start + chunk_size, array.shape[0])
+        chunk = np.asarray(array[start:stop])
+        if chunk.size == 0:
+            continue
+        chunk_max = float(np.nanmax(chunk))
+        if chunk_max > max_value:
+            max_value = chunk_max
+    if max_value == float("-inf"):
+        return 0.0
+    return max_value
 
 
 def _make_session_handler(root: Path, episodes: list[Path]) -> type[BaseHTTPRequestHandler]:
