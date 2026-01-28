@@ -367,6 +367,7 @@ def _convert_episode(
     streams: set[str] | None = None,
 ) -> None:
     import rerun as rr
+    import rerun.blueprint as rrb
 
     rr.init("dexumi-viz", spawn=spawn)
     if output_path is not None:
@@ -379,7 +380,67 @@ def _convert_episode(
     _log_calibration_points(episode_path)
     _log_sensor_groups(episode_path, summary.sensors, streams=streams, time_sync=time_sync)
 
-    # rr.init(spawn=True) already launches the viewer.
+    # Build and send blueprint for proper visualization layout
+    _send_visualization_blueprint(summary, streams)
+
+
+def _send_visualization_blueprint(summary: EpisodeSummary, streams: set[str] | None) -> None:
+    """Send a blueprint to Rerun for optimal visualization layout."""
+    import rerun as rr
+    import rerun.blueprint as rrb
+
+    # Collect camera sensors for 2D views
+    camera_views = []
+    for sensor in summary.sensors:
+        if sensor.kind == "camera" or "camera" in sensor.name.lower():
+            if streams is None or _sensor_matches_streams(sensor, streams):
+                # Create 2D view for each camera
+                camera_views.append(
+                    rrb.Spatial2DView(
+                        name=sensor.name,
+                        origin=f"/sensors/{sensor.name}",
+                    )
+                )
+
+    # Time series view for numeric sensors (fsr, joint_angles, etc.)
+    timeseries_view = rrb.TimeSeriesView(
+        name="Sensors",
+        origin="/",
+        contents=[
+            "/robot/joints/**",
+            "/sensors/fsr/**",
+            "/_properties/**",
+        ],
+    )
+
+    # Text view for episode summary
+    text_view = rrb.TextDocumentView(
+        name="Summary",
+        origin="/episode/summary",
+    )
+
+    # Build layout: cameras on top row, sensors + summary on bottom
+    if camera_views:
+        # Grid of cameras (max 4 per row)
+        if len(camera_views) <= 2:
+            camera_row = rrb.Horizontal(*camera_views)
+        else:
+            camera_row = rrb.Grid(*camera_views, columns=min(4, len(camera_views)))
+
+        blueprint = rrb.Blueprint(
+            rrb.Vertical(
+                camera_row,
+                rrb.Horizontal(timeseries_view, text_view, column_shares=[3, 1]),
+                row_shares=[2, 1],
+            )
+        )
+    else:
+        # No cameras, just sensors and summary
+        blueprint = rrb.Blueprint(
+            rrb.Horizontal(timeseries_view, text_view, column_shares=[3, 1])
+        )
+
+    rr.send_blueprint(blueprint)
 
 
 def _summary_to_text(summary: EpisodeSummary) -> str:
