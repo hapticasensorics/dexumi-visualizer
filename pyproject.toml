@@ -1,0 +1,32 @@
+[project]
+name = "dexumi-visualizer"
+version = "0.1.0"
+description = "Visualize DexUMI dexterous manipulation datasets with Rerun and HapticaGUI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "rerun-sdk>=0.18",
+    "numpy>=1.24",
+    "zarr>=2.16",
+    "h5py>=3.0",
+    "opencv-python>=4.8",
+    "httpx>=0.25",
+    "typer>=0.9",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+dexumi-viz = "dexumi_visualizer.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
